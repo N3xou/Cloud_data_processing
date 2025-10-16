@@ -1,0 +1,33 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cifar10_api
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "7860:7860"
+    environment:
+      - DATABASE_URL=postgresql://postgres:app@db:5432/cifar10
+    restart: unless-stopped
+
+  db:
+    image: postgres:14
+    container_name: cifar10_db
+    restart: always
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: cifar10  # Changed to lowercase
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pgdata:

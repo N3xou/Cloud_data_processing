@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+torch
+torchvision
+pillow
+sqlalchemy
+psycopg2-binary
+huggingface_hub
+httpx>=0.24.0
