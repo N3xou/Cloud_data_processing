@@ -1,33 +1,155 @@
-services:
-  api:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    container_name: cifar10_api
-    depends_on:
-      db:
-        condition: service_healthy
-    ports:
-      - "5432:5432"
-    environment:
-      - DATABASE_URL=postgresql://postgres:app@db:5432/cifar10
-    restart: unless-stopped
+version: '3.8'
 
+services:
+  # PostgreSQL Database (local)
   db:
     image: postgres:14
     container_name: cifar10_db
     restart: always
     environment:
       POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: app
-      POSTGRES_DB: cifar10  # Changed to lowercase
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: cifar10
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres"]
       interval: 10s
       timeout: 5s
       retries: 5
+    networks:
+      - observability
+
+  # FastAPI application
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: cifar10_api
+    ports:
+      - "7860:7860"
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/cifar10
+      - OTEL_COLLECTOR_ENDPOINT=otel-collector:4317
+    depends_on:
+      db:
+        condition: service_healthy
+      otel-collector:
+        condition: service_started
+    restart: unless-stopped
+    networks:
+      - observability
+
+  # OpenTelemetry Collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.91.0
+    container_name: otel_collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml
+    ports:
+      - "4317:4317"   # OTLP gRPC receiver
+      - "4318:4318"   # OTLP HTTP receiver
+      - "8889:8889"   # Prometheus metrics exporter
+    depends_on:
+      - tempo
+      - loki
+    restart: unless-stopped
+    networks:
+      - observability
+
+  # Tempo (for traces)
+  tempo:
+    image: grafana/tempo:2.3.1
+    container_name: tempo
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes:
+      - ./tempo-config.yaml:/etc/tempo.yaml
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200"   # Tempo HTTP
+      - "4317"        # OTLP gRPC receiver
+    restart: unless-stopped
+    networks:
+      - observability
+
+  # Loki (for logs)
+  loki:
+    image: grafana/loki:2.9.3
+    container_name: loki
+    command: -config.file=/etc/loki/local-config.yaml
+    ports:
+      - "3100:3100"
+    volumes:
+      - loki-data:/loki
+    restart: unless-stopped
+    networks:
+      - observability
+
+  # Prometheus (for metrics)
+  prometheus:
+    image: prom/prometheus:v2.48.1
+    container_name: prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    networks:
+      - observability
+
+  # Postgres Exporter (for DB metrics)
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: postgres_exporter
+    environment:
+      DATA_SOURCE_NAME: "postgresql://postgres:postgres@db:5432/cifar10?sslmode=disable"
+    ports:
+      - "9187:9187"
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - observability
+
+  # Grafana (for visualization)
+  grafana:
+    image: grafana/grafana:10.2.3
+    container_name: grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/datasources.yml:/etc/grafana/provisioning/datasources/datasources.yml
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+      - loki
+      - tempo
+    restart: unless-stopped
+    networks:
+      - observability
+
+networks:
+  observability:
+    driver: bridge
 
 volumes:
-  pgdata:
+  postgres-data:
+  tempo-data:
+  loki-data:
+  prometheus-data:
+  grafana-data:

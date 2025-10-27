@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 import os
 import time
-
+from opentelemetry.instrumentation.sqlalchemy import SQLAlchemyInstrumentor
 DB_URL = os.getenv("DATABASE_URL")
 
 if not DB_URL:
@@ -30,6 +30,9 @@ else:
     print("⚙️ Using QueuePool (local database)")
 
 engine = create_engine(DB_URL, **pool_config)
+
+SQLAlchemyInstrumentor().instrument(engine=engine)
+
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
