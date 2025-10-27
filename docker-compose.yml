@@ -8,7 +8,7 @@ services:
       db:
         condition: service_healthy
     ports:
-      - "7860:7860"
+      - "5432:5432"
     environment:
       - DATABASE_URL=postgresql://postgres:app@db:5432/cifar10
     restart: unless-stopped

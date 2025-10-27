@@ -6,4 +6,6 @@ pillow
 sqlalchemy
 psycopg2-binary
 huggingface_hub
+python-multipart
+
 httpx>=0.24.0
