@@ -318,3 +318,4 @@ async def predict(
             content={"error": str(e), "trace_id": trace_id},
             status_code=500
         )
+    #commit status
