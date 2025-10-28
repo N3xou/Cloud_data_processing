@@ -33,7 +33,7 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # HF Space API endpoint
-HF_SPACE_URL = "https://iYami-1.hf.space"
+HF_SPACE_URL = "https://iYami-cloud.hf.space"
 PREDICT_ENDPOINT = f"{HF_SPACE_URL}/api/predict"
 
 # OpenTelemetry configuration
