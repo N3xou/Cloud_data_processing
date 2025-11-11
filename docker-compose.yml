@@ -142,7 +142,18 @@ services:
     restart: unless-stopped
     networks:
       - observability
-
+k6:
+    image: grafana/k6:latest
+    container_name: k6
+    environment:
+      - K6_PROMETHEUS_RW_SERVER_URL=http://prometheus:9090/api/v1/write
+      - K6_PROMETHEUS_RW_TREND_AS_NATIVE_HISTOGRAM=true
+    volumes:
+      - ./k6-tests:/scripts
+    networks:
+      - observability
+    # Don't auto-start k6, run tests manually
+    entrypoint: ["sleep", "infinity"]
 networks:
   observability:
     driver: bridge
@@ -153,3 +164,6 @@ volumes:
   loki-data:
   prometheus-data:
   grafana-data:
+
+
+
