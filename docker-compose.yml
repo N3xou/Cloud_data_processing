@@ -142,7 +142,7 @@ services:
     restart: unless-stopped
     networks:
       - observability
-k6:
+  k6:
     image: grafana/k6:latest
     container_name: k6
     environment:
