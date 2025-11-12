@@ -5,7 +5,7 @@ from contextlib import asynccontextmanager
 import httpx
 import logging
 import time
-
+from prometheus_fastapi_instrumentator import Instrumentator
 from db import init_db, get_db
 from models import Prediction, ExternalApiCall
 
@@ -30,6 +30,8 @@ from opentelemetry.sdk._logs.export import BatchLogRecordProcessor
 from opentelemetry.exporter.otlp.proto.grpc._log_exporter import OTLPLogExporter
 import os
 
+
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -40,7 +42,7 @@ PREDICT_ENDPOINT = f"{HF_SPACE_URL}/api/predict"
 
 # External API endpoint (configurable via env var)
 EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "https://jsonplaceholder.typicode.com/posts/1")
-HTTP_VERSION = os.getenv("HTTP_VERSION", "1.1")  # "1.1" or "2"
+HTTP_VERSION = os.getenv("HTTP_VERSION", "2")  # "1.1" or "2"
 
 # OpenTelemetry configuration
 OTEL_COLLECTOR_ENDPOINT = os.getenv("OTEL_COLLECTOR_ENDPOINT", "otel-collector:4317")
@@ -155,6 +157,7 @@ FastAPIInstrumentor.instrument_app(app)
 # Auto-instrument HTTPX
 HTTPXClientInstrumentor().instrument()
 
+Instrumentator().instrument(app).expose(app, endpoint="/metrics")
 # Auto-instrument SQLAlchemy
 from db import engine
 
@@ -329,6 +332,7 @@ async def predict(
 
 @app.post("/external-call", tags=["Load Testing"])
 async def external_call(db: Session = Depends(get_db)):
+    request_counter.add(1, {"endpoint": "/external-call", "method": "POST"})
     """
     Load testing endpoint that:
     1. Calls an external API (configurable via EXTERNAL_API_URL env var)
@@ -470,6 +474,7 @@ async def external_call(db: Session = Depends(get_db)):
         }
 
     except httpx.HTTPError as e:
+        error_counter.add(1, {"endpoint": "/external-call", "error": "http_error"})
         error_duration = (time.time() - overall_start) * 1000
 
         logger.error(
