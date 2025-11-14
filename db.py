@@ -72,10 +72,9 @@ def get_db():
         yield db
     except Exception as e:
         print(f"❌ Database session error: {e}")
-        try:
-            db.rollback()
-        except:
-            pass
+
+        db.rollback()
+        raise
     finally:
         try:
             db.close()
