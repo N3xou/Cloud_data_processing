@@ -66,7 +66,7 @@ services:
       - HTTP_MAX_KEEPALIVE=200    # Test with different values: 10, 20, 50, 100
       - HTTP_MAX_CONNECTIONS=100    # Test with: 20, 50, 100, 200
       - HTTP_KEEPALIVE_EXPIRY=30.0 # Test with: 10, 30, 60
-      - HTTP_READ_TIMEOUT=30.0
+      - HTTP_READ_TIMEOUT=1200.0
       - HTTP_CONNECT_TIMEOUT=10.0
     depends_on:
       db:
