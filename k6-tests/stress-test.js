@@ -1,32 +1,42 @@
 import http from 'k6/http';
 import { check, sleep } from 'k6';
 
-// Stress test - Push the system to its limits
+// Stress test to find breaking point
+// Starts at 50 VUs and increases gradually to 400
 export const options = {
   stages: [
-    { duration: '2m', target: 100 },  // Ramp up to 100 users
-    { duration: '5m', target: 100 },  // Stay at 100 users
-    { duration: '2m', target: 200 },  // Push to 200 users
-    { duration: '5m', target: 200 },  // Stay at 200 users
-    { duration: '2m', target: 0 },    // Ramp down
+    { duration: '1m', target: 150 },   // Increase to 200
+    { duration: '1m', target: 150 },   // Hold at 200
+    { duration: '1m', target: 250 },   // Increase to 250
+    { duration: '1m', target: 250 },   // Hold at 250
+    { duration: '1m', target: 350 },   // Push to 350
+    { duration: '1m', target: 350 },   // Hold at 350
+    { duration: '1m', target: 0 },     // Ramp down
   ],
   thresholds: {
-    http_req_duration: ['p(99)<3000'], // 99% under 3s
-    http_req_failed: ['rate<0.2'],     // Less than 20% errors
+    http_req_failed: ['rate<0.5'],      // Allow up to 50% errors (finding breaking point)
+    http_req_duration: ['p(99)<10000'], // 99% under 10 seconds
   },
 };
 
 export default function () {
-  const url = 'http://api:7860/external-call';
+  const url = __ENV.API_URL || 'http://host.docker.internal:7860/external-call';
 
   const response = http.post(url, null, {
     headers: { 'Content-Type': 'application/json' },
+    timeout: '180s',
+    idleConnectionTimeout: '0s'
   });
 
-  check(response, {
+  const success = check(response, {
     'status is 200': (r) => r.status === 200,
-    'response time OK': (r) => r.timings.duration < 3000,
+    'status not 500': (r) => r.status !== 500,
+    'status not timeout': (r) => r.status !== 0,
   });
 
-  sleep(0.1); // Short sleep to increase load
+  if (!success) {
+    console.log(`[VU ${__VU}] Failed - Status: ${response.status}, Time: ${new Date().toISOString()}`);
+  }
+
+  //sleep(0.1); // Short sleep to maximize load
 }

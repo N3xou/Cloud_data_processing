@@ -17,8 +17,8 @@ print(f"📡 Database URL: {DB_URL.split('@')[0] if '@' in DB_URL else 'local'}"
 use_null_pool = "external" in DB_URL or DB_URL.startswith("postgresql://") and not "db:5432" in DB_URL
 
 pool_config = {
-    "pool_size": 5,
-    "max_overflow": 10,
+    "pool_size": 50,
+    "max_overflow": 50,
     "pool_recycle": 3600,
     "pool_pre_ping": True,
 }

@@ -11,6 +11,10 @@ scrape_configs:
     static_configs:
       - targets: ['api:7860']
     metrics_path: '/metrics'
+    metric_relabel_configs:
+      - source_labels: [ http_server_name ]
+        target_label: http_server_name
+        replacement: "api"
 
   # Scrape metrics from OTel Collector
   - job_name: 'otel-collector'

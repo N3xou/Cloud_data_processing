@@ -3,6 +3,7 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
 import httpx
+import asyncio
 import logging
 import time
 
@@ -41,8 +42,42 @@ HF_SPACE_URL = "https://iYami-cloud.hf.space"
 PREDICT_ENDPOINT = f"{HF_SPACE_URL}/api/predict"
 
 # External API endpoint (configurable via env var)
-EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "https://jsonplaceholder.typicode.com/posts/1")
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "https://jsonplaceholder.typicode.com/posts/1") #"http://api:7860/mock-api") # Use local mock
 HTTP_VERSION = os.getenv("HTTP_VERSION", "1.1")  # "1.1" or "2"
+OUT_PROTOCOL = os.getenv("OUT_PROTOCOL", "h1")  # "h1" or "h2" for testing
+
+# HTTP Client Configuration (all configurable via env vars)
+OUT_MAX_CONNECTIONS = int(os.getenv("OUT_MAX_CONNECTIONS", "50"))  # Default: 50
+OUT_MAX_KEEPALIVE = int(os.getenv("OUT_MAX_KEEPALIVE", "20"))  # Default: 20
+OUT_KEEPALIVE_EXPIRY = float(os.getenv("OUT_KEEPALIVE_EXPIRY", "30.0"))  # Default: 30s
+OUT_READ_TIMEOUT = float(os.getenv("OUT_READ_TIMEOUT", "180.0"))  # Default: 180s
+OUT_CONNECT_TIMEOUT = float(os.getenv("OUT_CONNECT_TIMEOUT", "5.0"))  # Default: 5s
+OUT_POOL_TIMEOUT_MS = int(os.getenv("OUT_POOL_TIMEOUT_MS", "0"))  # Default: 0 (no limit)
+
+# HTTP Client Singleton with connection pooling
+http_client_limits = httpx.Limits(
+    max_keepalive_connections=OUT_MAX_KEEPALIVE,
+    max_connections=OUT_MAX_CONNECTIONS,
+    keepalive_expiry=OUT_KEEPALIVE_EXPIRY
+)
+
+# Convert pool timeout from ms to seconds (0 = None)
+pool_timeout = None if OUT_POOL_TIMEOUT_MS == 0 else (OUT_POOL_TIMEOUT_MS / 1000.0)
+
+http_client_timeout = httpx.Timeout(
+    timeout=OUT_READ_TIMEOUT,
+    connect=OUT_CONNECT_TIMEOUT,
+    pool=pool_timeout
+)
+
+# Global HTTP client (singleton)
+http2_enabled = (OUT_PROTOCOL == "h2" or HTTP_VERSION == "2")
+global_http_client = httpx.AsyncClient(
+    http2=http2_enabled,
+    timeout=http_client_timeout,
+    limits=http_client_limits,
+    follow_redirects=True
+)
 
 # OpenTelemetry configuration
 OTEL_COLLECTOR_ENDPOINT = os.getenv("OTEL_COLLECTOR_ENDPOINT", "otel-collector:4317")
@@ -185,11 +220,21 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Could not reach HF Space: {e}")
 
-    logger.info("✅ API ready with OpenTelemetry instrumentation!")
+    logger.info(f"✅ API ready with OpenTelemetry instrumentation!")
+    logger.info(f"⚙️ HTTP client config:")
+    logger.info(f"   - Protocol: {OUT_PROTOCOL}")
+    logger.info(f"   - Read timeout: {OUT_READ_TIMEOUT}s")
+    logger.info(f"   - Connect timeout: {OUT_CONNECT_TIMEOUT}s")
+    logger.info(f"   - Pool timeout: {OUT_POOL_TIMEOUT_MS}ms")
+    logger.info(f"   - Max connections: {OUT_MAX_CONNECTIONS}")
+    logger.info(f"   - Max keepalive: {OUT_MAX_KEEPALIVE}")
+    logger.info(f"   - Keepalive expiry: {OUT_KEEPALIVE_EXPIRY}s")
+
     yield
 
     # Shutdown
     logger.info("👋 Shutting down API...")
+    await global_http_client.aclose()
 
 
 # FastAPI app
@@ -237,6 +282,32 @@ def prometheus_metrics():
     return Response(generate_latest(REGISTRY), media_type=CONTENT_TYPE_LATEST)
 
 
+@app.get("/mock-api", tags=["Testing"])
+async def mock_external_api(delay: int = 0):
+    """
+    Mock external API for testing purposes.
+    Supports configurable delay to simulate slow downstream services.
+
+    Query params:
+    - delay: Response delay in seconds (0-120), default 0
+    """
+    import random
+
+    # Validate delay range
+    delay = max(0, min(delay, 120))
+
+    if delay > 0:
+        await asyncio.sleep(delay)
+
+    return {
+        "id": random.randint(1, 1000),
+        "title": "Mock API Response",
+        "body": "This is a simulated external API response",
+        "delay_seconds": delay,
+        "timestamp": time.time()
+    }
+
+
 @app.post("/external-call", tags=["Load Testing"])
 async def external_call(db: Session = Depends(get_db)):
     """
@@ -254,25 +325,20 @@ async def external_call(db: Session = Depends(get_db)):
     """
     request_id = str(uuid.uuid4())
     current_span = trace.get_current_span()
-    trace_id = format(current_span.get_span_context().trace_id, '032x')
+    trace_id = format(current_span.get_span_context().trace_id, "032x")
+    correlation_id = f"req-{request_id[:8]}"
 
     overall_start = time.time()
 
-    # Record request start (Prometheus)
-    prom_external_requests.labels(status='started').inc()
-
-    # Record request (OpenTelemetry)
+    prom_external_requests.labels(status="started").inc()
     external_api_request_counter.add(1, {"endpoint": "/external-call", "method": "POST"})
 
     logger.info(
-        f"🔄 External API call started",
-        extra={"trace_id": trace_id, "request_id": request_id}
+        "🔄 External API call started",
+        extra={"trace_id": trace_id, "request_id": request_id, "correlation_id": correlation_id}
     )
 
     try:
-        # Configure HTTP version
-        http2 = (HTTP_VERSION == "2")
-
         with tracer.start_as_current_span("call_external_api") as span:
             span.set_attribute("external.url", EXTERNAL_API_URL)
             span.set_attribute("http.version", HTTP_VERSION)
@@ -281,54 +347,52 @@ async def external_call(db: Session = Depends(get_db)):
             api_start = time.time()
 
             try:
-                # Call external API with configurable HTTP version
-                async with httpx.AsyncClient(http2=http2, timeout=30.0) as client:
-                    response = await client.get(EXTERNAL_API_URL)
-                    response.raise_for_status()
+                response = await global_http_client.get(EXTERNAL_API_URL)
+                response.raise_for_status()
 
-                    api_duration = (time.time() - api_start) * 1000
+                api_duration = (time.time() - api_start) * 1000
 
-                    # Record external API duration metric
-                    external_api_duration.record(api_duration, {"status": "success", "http_version": HTTP_VERSION})
+                prom_external_duration.labels(http_version=HTTP_VERSION).observe(api_duration / 1000)
+                external_api_duration.record(api_duration, {"status": "success", "http_version": HTTP_VERSION})
 
-                    # Validate and transform response
-                    data = response.json()
+                data = response.json()
 
-                    # Create compact summary (don't store full response)
-                    if isinstance(data, dict):
-                        summary = {
-                            "title": data.get("title", "")[:100],  # First 100 chars
-                            "keys": list(data.keys())[:10],  # First 10 keys
-                            "size": len(str(data))
-                        }
-                    elif isinstance(data, list):
-                        summary = {
-                            "count": len(data),
-                            "first_item": str(data[0])[:100] if data else None
-                        }
-                    else:
-                        summary = {"type": str(type(data)), "value": str(data)[:100]}
+                # Create compact summary
+                if isinstance(data, dict):
+                    summary = {
+                        "title": data.get("title", "")[:100],
+                        "keys": list(data.keys())[:10],
+                        "size": len(str(data)),
+                    }
+                elif isinstance(data, list):
+                    summary = {
+                        "count": len(data),
+                        "first_item": str(data[0])[:100] if data else None,
+                    }
+                else:
+                    summary = {"type": str(type(data)), "value": str(data)[:100]}
 
-                    span.set_attribute("response.status", response.status_code)
-                    span.set_attribute("response.size", len(response.content))
-                    span.set_attribute("api.duration.ms", api_duration)
+                span.set_attribute("response.status", response.status_code)
+                span.set_attribute("response.size", len(response.content))
+                span.set_attribute("api.duration.ms", api_duration)
 
-                    logger.info(
-                        f"✅ External API responded",
-                        extra={
-                            "trace_id": trace_id,
-                            "request_id": request_id,
-                            "status": response.status_code,
-                            "duration_ms": api_duration
-                        }
-                    )
+                logger.info(
+                    "✅ External API responded",
+                    extra={
+                        "trace_id": trace_id,
+                        "request_id": request_id,
+                        "status": response.status_code,
+                        "duration_ms": api_duration,
+                    }
+                )
+
             except httpx.HTTPError as api_error:
                 api_duration = (time.time() - api_start) * 1000
                 external_api_duration.record(api_duration, {"status": "error", "http_version": HTTP_VERSION})
                 external_api_error_counter.add(1, {"error_type": "external_api_failed"})
                 raise api_error
 
-        # Store in database
+        # --- Database Write ---
         db_duration = 0
         if db is not None:
             with tracer.start_as_current_span("db_write") as db_span:
@@ -342,9 +406,9 @@ async def external_call(db: Session = Depends(get_db)):
                     status_code=response.status_code,
                     response_summary=json.dumps(summary),
                     is_success=True,
-                    request_duration_ms=0,  # Will update below
+                    request_duration_ms=0,
                     external_api_duration_ms=api_duration,
-                    db_write_duration_ms=0  # Will update below
+                    db_write_duration_ms=0,
                 )
 
                 db.add(api_call_record)
@@ -353,26 +417,25 @@ async def external_call(db: Session = Depends(get_db)):
                 db_duration = (time.time() - db_start) * 1000
                 db_span.set_attribute("db.duration.ms", db_duration)
 
-                # Record DB write metric
+                prom_db_write_duration.observe(db_duration / 1000)
                 db_write_duration.record(db_duration, {"operation": "insert"})
 
-                # Update the record with accurate durations
                 api_call_record.db_write_duration_ms = db_duration
                 api_call_record.request_duration_ms = (time.time() - overall_start) * 1000
                 db.commit()
 
                 logger.info(
-                    f"💾 Stored in database",
+                    "💾 Stored in database",
                     extra={
                         "trace_id": trace_id,
                         "request_id": request_id,
-                        "db_duration_ms": db_duration
+                        "db_duration_ms": db_duration,
                     }
                 )
 
         total_duration = (time.time() - overall_start) * 1000
+        prom_external_requests.labels(status="success").inc()
 
-        # Return summary
         return {
             "request_id": request_id,
             "trace_id": trace_id,
@@ -381,38 +444,40 @@ async def external_call(db: Session = Depends(get_db)):
                 "url": EXTERNAL_API_URL,
                 "http_version": f"HTTP/{HTTP_VERSION}",
                 "status_code": response.status_code,
-                "duration_ms": round(api_duration, 2)
+                "duration_ms": round(api_duration, 2),
             },
             "database": {
                 "write_duration_ms": round(db_duration, 2) if db else None,
-                "stored": db is not None
+                "stored": db is not None,
             },
             "performance": {
                 "total_duration_ms": round(total_duration, 2),
                 "breakdown": {
                     "external_api": round(api_duration, 2),
                     "database": round(db_duration, 2) if db else 0,
-                    "overhead": round(total_duration - api_duration - (db_duration if db else 0), 2)
-                }
+                    "overhead": round(total_duration - api_duration - (db_duration if db else 0), 2),
+                },
             },
-            "response_summary": summary
+            "response_summary": summary,
         }
 
     except httpx.HTTPError as e:
         error_duration = (time.time() - overall_start) * 1000
+
+        prom_external_requests.labels(status="error").inc()
+        prom_external_errors.labels(error_type="http_error").inc()
         external_api_error_counter.add(1, {"error_type": "http_error"})
 
         logger.error(
-            f"❌ External API call failed",
+            "❌ External API call failed",
             extra={
                 "trace_id": trace_id,
                 "request_id": request_id,
                 "error": str(e),
-                "duration_ms": error_duration
+                "duration_ms": error_duration,
             }
         )
 
-        # Store failure in DB
         if db is not None:
             try:
                 api_call_record = ExternalApiCall(
@@ -425,7 +490,7 @@ async def external_call(db: Session = Depends(get_db)):
                     is_success=False,
                     request_duration_ms=error_duration,
                     external_api_duration_ms=0,
-                    db_write_duration_ms=0
+                    db_write_duration_ms=0,
                 )
                 db.add(api_call_record)
                 db.commit()
@@ -435,12 +500,16 @@ async def external_call(db: Session = Depends(get_db)):
         raise HTTPException(status_code=502, detail=f"External API failed: {str(e)}")
 
     except Exception as e:
+        prom_external_requests.labels(status="error").inc()
+        prom_external_errors.labels(error_type="internal_error").inc()
         external_api_error_counter.add(1, {"error_type": "internal_error"})
+
         logger.error(
-            f"❌ Unexpected error",
+            "❌ Unexpected error",
             extra={"trace_id": trace_id, "request_id": request_id},
             exc_info=True
         )
+
         raise HTTPException(status_code=500, detail=str(e))
 
 
