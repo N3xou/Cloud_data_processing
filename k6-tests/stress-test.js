@@ -5,6 +5,8 @@ import { check, sleep } from 'k6';
 // Starts at 50 VUs and increases gradually to 400
 export const options = {
   stages: [
+    { duration: '1m', target: 50 },   // Increase to 200
+    { duration: '1m', target: 50 },   // Hold at 200
     { duration: '1m', target: 150 },   // Increase to 200
     { duration: '1m', target: 150 },   // Hold at 200
     { duration: '1m', target: 250 },   // Increase to 250

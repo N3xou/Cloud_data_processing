@@ -3,7 +3,7 @@ import { check, sleep } from 'k6';
 
 // Get test parameters from environment variables
 const VUS = parseInt(__ENV.VUS || '50');           // Number of virtual users
-const DURATION = __ENV.DURATION || '3m';           // Test duration
+const DURATION = __ENV.DURATION || '2m';           // Test duration
 const RAMP_UP = __ENV.RAMP_UP || '1m';            // Ramp up time
 const MOCK_DELAY = parseInt(__ENV.MOCK_DELAY || '0'); // Mock API delay in seconds
 

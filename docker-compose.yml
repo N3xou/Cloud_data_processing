@@ -4,35 +4,7 @@ services:
     image: postgres:14
     container_name: cifar10_db
     restart: always
-    command: >
-      postgres
-      -c shared_buffers=8MB
-      -c maintenance_work_mem=1MB
-      -c autovacuum_vacuum_insert_threshold=1
-      -c autovacuum_vacuum_threshold=0
-      -c autovacuum_vacuum_scale_factor=0
-      -c autovacuum_naptime=1
-      -c autovacuum_analyze_threshold=0
-      -c autovacuum_analyze_scale_factor=0
-      -c vacuum_cost_limit=10000
-      -c vacuum_cost_page_dirty=0
-      -c vacuum_cost_page_hit=0
-      -c vacuum_cost_page_miss=0
-      -c wal_writer_flush_after=0
-      -c wal_writer_delay=1
-      -c min_wal_size=32MB
-      -c max_wal_size=32MB
-      -c checkpoint_timeout=30
-      -c wal_sync_method=open_datasync
-      -c wal_level=logical
-      -c wal_log_hints=on
-      -c track_io_timing=on
-      -c checkpoint_completion_target=0
-      -c random_page_cost=1000
-      -c cpu_index_tuple_cost=1000
-      -c log_autovacuum_min_duration=0
-      -c logging_collector=on
-      -c log_destination=stderr
+
 
     environment:
       POSTGRES_USER: postgres
@@ -63,11 +35,12 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/cifar10
       - OTEL_COLLECTOR_ENDPOINT=otel-collector:4317
       - HTTP_VERSION=1.1
-      - HTTP_MAX_KEEPALIVE=200    # Test with different values: 10, 20, 50, 100
-      - HTTP_MAX_CONNECTIONS=100    # Test with: 20, 50, 100, 200
+      - HTTP_MAX_KEEPALIVE=500   # Test with different values: 10, 20, 50, 100
+      - HTTP_MAX_CONNECTIONS=1000  # Test with: 20, 50, 100, 200
       - HTTP_KEEPALIVE_EXPIRY=30.0 # Test with: 10, 30, 60
       - HTTP_READ_TIMEOUT=1200.0
       - HTTP_CONNECT_TIMEOUT=10.0
+      - OUT_POOL_TIMEOUT_MS=50
     depends_on:
       db:
         condition: service_healthy
