@@ -25,6 +25,7 @@ class ExternalApiCall(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     request_id = Column(String(36), unique=True, index=True)  # UUID for tracking
+    correlation_id = Column(String(50), index=True)
     external_url = Column(String(512))
     http_method = Column(String(10))
     http_version = Column(String(10))  # HTTP/1.1 or HTTP/2

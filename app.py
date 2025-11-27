@@ -1,4 +1,4 @@
-from fastapi import FastAPI, UploadFile, File, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File, Depends, HTTPException, Header, Query
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from contextlib import asynccontextmanager
@@ -6,6 +6,8 @@ import httpx
 import asyncio
 import logging
 import time
+from aiokafka import AIOKafkaProducer
+import aio_pika
 
 from db import init_db, get_db
 from models import Prediction, ExternalApiCall
@@ -42,7 +44,7 @@ HF_SPACE_URL = "https://iYami-cloud.hf.space"
 PREDICT_ENDPOINT = f"{HF_SPACE_URL}/api/predict"
 
 # External API endpoint (configurable via env var)
-EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "https://jsonplaceholder.typicode.com/posts/1") #"http://api:7860/mock-api") # Use local mock
+EXTERNAL_API_URL = os.getenv("EXTERNAL_API_URL", "http://api:7860/mock-api") # Use local mock"https://jsonplaceholder.typicode.com/posts/1")
 HTTP_VERSION = os.getenv("HTTP_VERSION", "1.1")  # "1.1" or "2"
 OUT_PROTOCOL = os.getenv("OUT_PROTOCOL", "h1")  # "h1" or "h2" for testing
 
@@ -54,6 +56,14 @@ OUT_READ_TIMEOUT = float(os.getenv("OUT_READ_TIMEOUT", "180.0"))  # Default: 180
 OUT_CONNECT_TIMEOUT = float(os.getenv("OUT_CONNECT_TIMEOUT", "5.0"))  # Default: 5s
 OUT_POOL_TIMEOUT_MS = int(os.getenv("OUT_POOL_TIMEOUT_MS", "0"))  # Default: 0 (no limit)
 
+BROKER_MODE = os.getenv("BROKER_MODE", "kafka")
+KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "kafka:29092")
+RABBITMQ_URL = os.getenv("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+
+# Initialize message producers (will be set in lifespan)
+kafka_producer = None
+rabbitmq_connection = None
+rabbitmq_channel = None
 # HTTP Client Singleton with connection pooling
 http_client_limits = httpx.Limits(
     max_keepalive_connections=OUT_MAX_KEEPALIVE,
@@ -204,13 +214,62 @@ prom_db_write_duration = Histogram(
 # Lifespan handler
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    global kafka_producer, rabbitmq_connection, rabbitmq_channel
+
     logger.info("🚀 Starting CIFAR-10 API with observability...")
+
+    # Initialize database
     try:
         init_db()
         logger.info("✅ Database connected")
     except Exception as e:
         logger.error(f"⚠️ Database initialization failed: {e}")
+
+    # Initialize Kafka with retries
+    for attempt in range(5):
+        try:
+            logger.info(f"Attempting Kafka connection (attempt {attempt + 1}/5)...")
+            kafka_producer = AIOKafkaProducer(
+                bootstrap_servers=KAFKA_BOOTSTRAP_SERVERS,
+                value_serializer=lambda v: json.dumps(v).encode('utf-8'),
+                request_timeout_ms=10000,
+                connections_max_idle_ms=180000
+            )
+            await kafka_producer.start()
+            logger.info("✅ Kafka producer initialized")
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ Kafka attempt {attempt + 1} failed: {e}")
+            if attempt < 4:
+                await asyncio.sleep(5)
+            else:
+                logger.error("❌ Kafka unavailable after all retries")
+                kafka_producer = None
+
+    # Initialize RabbitMQ with retries
+    for attempt in range(5):
+        try:
+            logger.info(f"Attempting RabbitMQ connection (attempt {attempt + 1}/5)...")
+            rabbitmq_connection = await aio_pika.connect_robust(
+                RABBITMQ_URL,
+                timeout=10.0
+            )
+            rabbitmq_channel = await rabbitmq_connection.channel()
+
+            # Declare queues
+            await rabbitmq_channel.declare_queue("async_upstream", durable=True)
+            await rabbitmq_channel.declare_queue("async_downstream", durable=True)
+
+            logger.info("✅ RabbitMQ initialized")
+            break
+        except Exception as e:
+            logger.warning(f"⚠️ RabbitMQ attempt {attempt + 1} failed: {e}")
+            if attempt < 4:
+                await asyncio.sleep(5)
+            else:
+                logger.error("❌ RabbitMQ unavailable after all retries")
+                rabbitmq_connection = None
+                rabbitmq_channel = None
 
     # Test HF Space connection
     try:
@@ -220,22 +279,19 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"⚠️ Could not reach HF Space: {e}")
 
-    logger.info(f"✅ API ready with OpenTelemetry instrumentation!")
-    logger.info(f"⚙️ HTTP client config:")
-    logger.info(f"   - Protocol: {OUT_PROTOCOL}")
-    logger.info(f"   - Read timeout: {OUT_READ_TIMEOUT}s")
-    logger.info(f"   - Connect timeout: {OUT_CONNECT_TIMEOUT}s")
-    logger.info(f"   - Pool timeout: {OUT_POOL_TIMEOUT_MS}ms")
-    logger.info(f"   - Max connections: {OUT_MAX_CONNECTIONS}")
-    logger.info(f"   - Max keepalive: {OUT_MAX_KEEPALIVE}")
-    logger.info(f"   - Keepalive expiry: {OUT_KEEPALIVE_EXPIRY}s")
+    logger.info(f"✅ API ready!")
+    logger.info(f"   - Kafka: {'✅ Ready' if kafka_producer else '❌ Unavailable'}")
+    logger.info(f"   - RabbitMQ: {'✅ Ready' if rabbitmq_channel else '❌ Unavailable'}")
 
     yield
 
     # Shutdown
-    logger.info("👋 Shutting down API...")
+    logger.info("👋 Shutting down...")
+    if kafka_producer:
+        await kafka_producer.stop()
+    if rabbitmq_connection:
+        await rabbitmq_connection.close()
     await global_http_client.aclose()
-
 
 # FastAPI app
 app = FastAPI(
@@ -291,6 +347,7 @@ async def mock_external_api(delay: int = 0):
     Query params:
     - delay: Response delay in seconds (0-120), default 0
     """
+    external_api_request_counter.add(1, {"endpoint": "/external-call", "method": "POST"})
     import random
 
     # Validate delay range
@@ -400,6 +457,7 @@ async def external_call(db: Session = Depends(get_db)):
 
                 api_call_record = ExternalApiCall(
                     request_id=request_id,
+                    correlation_id=correlation_id,
                     external_url=EXTERNAL_API_URL,
                     http_method="GET",
                     http_version=f"HTTP/{HTTP_VERSION}",
@@ -657,3 +715,153 @@ async def predict(
             content={"error": str(e), "trace_id": trace_id},
             status_code=500
         )
+
+
+@app.post("/external/fetch/async-upstream", tags=["Async Messaging"])
+async def async_upstream(
+        correlation_id: str = Header(None, alias="X-Correlation-ID"),
+        broker: str = Query("kafka", regex="^(kafka|rabbitmq)$"),
+        db: Session = Depends(get_db)
+):
+    if not correlation_id:
+        correlation_id = f"req-{uuid.uuid4().hex[:8]}"
+    logger.error("🔥 ENTERED ROUTE")
+    current_span = trace.get_current_span()
+    trace_id = format(current_span.get_span_context().trace_id, '032x')
+
+    message = {
+        "correlation_id": correlation_id,
+        "trace_id": trace_id,
+        "scenario": "async-upstream",
+        "external_url": EXTERNAL_API_URL,
+        "timestamp": time.time()
+    }
+
+    try:
+        if broker == "kafka":
+            if kafka_producer is None:
+                raise HTTPException(status_code=503, detail="Kafka producer not available")
+
+            # Add timeout to prevent hanging
+            await asyncio.wait_for(
+                kafka_producer.send("async_upstream", value=message),
+                timeout=35.0
+            )
+            logger.info(f"📤 Enqueued to Kafka", extra={"correlation_id": correlation_id})
+        else:  # rabbitmq
+            if rabbitmq_channel is None:
+                raise HTTPException(status_code=503, detail="RabbitMQ not available")
+
+            await asyncio.wait_for(
+                rabbitmq_channel.default_exchange.publish(
+                    aio_pika.Message(
+                        body=json.dumps(message).encode(),
+                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                    ),
+                    routing_key="async_upstream"
+                ),
+                timeout=35.0
+            )
+            logger.info(f"📤 Enqueued to RabbitMQ", extra={"correlation_id": correlation_id})
+
+        return JSONResponse(
+            status_code=202,
+            content={
+                "status": "accepted",
+                "correlation_id": correlation_id,
+                "trace_id": trace_id,
+                "message": "Request enqueued for processing",
+                "broker": broker
+            }
+        )
+
+    except asyncio.TimeoutError:
+        logger.error(f"Timeout enqueueing to {broker}", extra={"correlation_id": correlation_id})
+        raise HTTPException(status_code=504, detail=f"Timeout enqueueing to {broker}")
+    except Exception as e:
+        logger.error(f"Failed to enqueue: {e}", extra={"correlation_id": correlation_id})
+        raise HTTPException(status_code=500, detail=f"Failed to enqueue: {str(e)}")
+
+@app.post("/external/fetch/async-downstream", tags=["Async Messaging"])
+async def async_downstream(
+        correlation_id: str = Header(None, alias="X-Correlation-ID"),
+        broker: str = Query("kafka", regex="^(kafka|rabbitmq)$"),
+        db: Session = Depends(get_db)
+):
+    """
+    Scenario B: Async Downstream
+    API → External API → Queue → Worker → DB
+
+    Calls external API synchronously, then enqueues DB write task.
+    Returns response to client with External API result.
+    """
+    if not correlation_id:
+        correlation_id = f"req-{uuid.uuid4().hex[:8]}"
+
+    current_span = trace.get_current_span()
+    trace_id = format(current_span.get_span_context().trace_id, '032x')
+
+    try:
+        # Call external API synchronously (client waits)
+        with tracer.start_as_current_span("call_external_api") as span:
+            span.set_attribute("correlation_id", correlation_id)
+            span.set_attribute("scenario", "async-downstream")
+
+            api_start = time.time()
+            response = await global_http_client.get(EXTERNAL_API_URL)
+            response.raise_for_status()
+            api_duration = (time.time() - api_start) * 1000
+
+            result = response.json()
+
+            logger.info(
+                f"✅ External API responded",
+                extra={"correlation_id": correlation_id, "duration_ms": api_duration}
+            )
+
+        # Build message for async DB write
+        message = {
+            "correlation_id": correlation_id,
+            "trace_id": trace_id,
+            "scenario": "async-downstream",
+            "external_url": EXTERNAL_API_URL,
+            "status_code": response.status_code,
+            "response_data": result,
+            "duration_ms": api_duration,
+            "timestamp": time.time()
+        }
+
+        # Enqueue DB write task
+        if broker == "kafka":
+            await kafka_producer.send("async_downstream", value=message)
+        else:  # rabbitmq
+            await rabbitmq_channel.default_exchange.publish(
+                aio_pika.Message(
+                    body=json.dumps(message).encode(),
+                    delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                ),
+                routing_key="async_downstream",
+                timeout=0.5
+            )
+
+        logger.info(f"💾 DB write enqueued", extra={"correlation_id": correlation_id})
+
+        return {
+            "status": "success",
+            "correlation_id": correlation_id,
+            "trace_id": trace_id,
+            "external_api": {
+                "url": EXTERNAL_API_URL,
+                "status_code": response.status_code,
+                "duration_ms": round(api_duration, 2)
+            },
+            "database": {
+                "status": "enqueued",
+                "broker": broker
+            },
+            "result": result
+        }
+
+    except Exception as e:
+        logger.error(f"Error: {e}", extra={"correlation_id": correlation_id})
+        raise HTTPException(status_code=500, detail=str(e))

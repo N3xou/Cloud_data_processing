@@ -35,16 +35,24 @@ services:
       - DATABASE_URL=postgresql://postgres:postgres@db:5432/cifar10
       - OTEL_COLLECTOR_ENDPOINT=otel-collector:4317
       - HTTP_VERSION=1.1
-      - HTTP_MAX_KEEPALIVE=500   # Test with different values: 10, 20, 50, 100
-      - HTTP_MAX_CONNECTIONS=1000  # Test with: 20, 50, 100, 200
+      - HTTP_MAX_KEEPALIVE=50   # Test with different values: 10, 20, 50, 100
+      - HTTP_MAX_CONNECTIONS=100  # Test with: 20, 50, 100, 200
       - HTTP_KEEPALIVE_EXPIRY=30.0 # Test with: 10, 30, 60
       - HTTP_READ_TIMEOUT=1200.0
       - HTTP_CONNECT_TIMEOUT=10.0
-      - OUT_POOL_TIMEOUT_MS=50
+      - OUT_POOL_TIMEOUT_MS=0
+      - OUT_CONNECT_TIMEOUT=10.0
+      - BROKER_MODE=kafka
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
     depends_on:
       db:
         condition: service_healthy
       otel-collector:
+        condition: service_started
+      kafka:
+        condition: service_started
+      rabbitmq:
         condition: service_started
     restart: unless-stopped
     networks:
@@ -106,6 +114,7 @@ services:
       - '--web.console.libraries=/etc/prometheus/console_libraries'
       - '--web.console.templates=/etc/prometheus/consoles'
       - '--web.enable-lifecycle'
+      - '--enable-feature=remote-write-receiver'
     volumes:
       - ./prometheus.yml:/etc/prometheus/prometheus.yml
       - prometheus-data:/prometheus
@@ -162,6 +171,84 @@ services:
       - observability
     # Don't auto-start k6, run tests manually
     entrypoint: ["sleep", "infinity"]
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    networks:
+      - observability
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - observability
+
+    # RabbitMQ
+  rabbitmq:
+    image: rabbitmq:3.12-management
+    container_name: rabbitmq
+    ports:
+      - "5672:5672"   # AMQP
+      - "15672:15672" # Management UI
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    networks:
+      - observability
+
+    # Worker (handles messages from Kafka/RabbitMQ)
+  worker-kafka:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker_kafka
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/cifar10
+      - BROKER_MODE=kafka
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - EXTERNAL_API_URL=http://api:7860/mock-api
+      - OTEL_COLLECTOR_ENDPOINT=otel-collector:4317
+    depends_on:
+      - kafka
+      - db
+    restart: unless-stopped
+    networks:
+      - observability
+
+  worker-rabbitmq:
+    build:
+      context: .
+      dockerfile: Dockerfile.worker
+    container_name: worker_rabbitmq
+    environment:
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/cifar10
+      - BROKER_MODE=rabbitmq
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - EXTERNAL_API_URL=http://api:7860/mock-api
+      - OTEL_COLLECTOR_ENDPOINT=otel-collector:4317
+    depends_on:
+      - rabbitmq
+      - db
+    restart: unless-stopped
+    networks:
+      - observability
 networks:
   observability:
     driver: bridge
