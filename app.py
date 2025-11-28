@@ -723,9 +723,19 @@ async def async_upstream(
         broker: str = Query("kafka", regex="^(kafka|rabbitmq)$"),
         db: Session = Depends(get_db)
 ):
+    """
+    Scenario A: Async Upstream
+    API → Queue → Worker → External API → DB
+
+    Immediately returns 202 Accepted to client.
+    Worker handles External API call and DB write.
+    """
     if not correlation_id:
         correlation_id = f"req-{uuid.uuid4().hex[:8]}"
-    logger.error("🔥 ENTERED ROUTE")
+
+    # FIX: Change from logger.error to logger.info
+    logger.info("🔥 Processing async-upstream request", extra={"correlation_id": correlation_id})
+
     current_span = trace.get_current_span()
     trace_id = format(current_span.get_span_context().trace_id, '032x')
 
@@ -738,31 +748,53 @@ async def async_upstream(
     }
 
     try:
+        # FIX: Add explicit broker availability check
         if broker == "kafka":
             if kafka_producer is None:
+                logger.error(f"❌ Kafka producer not available", extra={"correlation_id": correlation_id})
                 raise HTTPException(status_code=503, detail="Kafka producer not available")
 
+            logger.info(f"📤 Enqueueing to Kafka...", extra={"correlation_id": correlation_id})
+
             # Add timeout to prevent hanging
-            await asyncio.wait_for(
-                kafka_producer.send("async_upstream", value=message),
-                timeout=35.0
-            )
-            logger.info(f"📤 Enqueued to Kafka", extra={"correlation_id": correlation_id})
+            try:
+                await asyncio.wait_for(
+                    kafka_producer.send("async_upstream", value=message),
+                    timeout=5.0  # FIX: Reduce timeout from 35s to 5s for faster failure detection
+                )
+                logger.info(f"✅ Enqueued to Kafka", extra={"correlation_id": correlation_id})
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ Kafka send timeout", extra={"correlation_id": correlation_id})
+                raise HTTPException(status_code=504, detail="Timeout enqueueing to Kafka")
+            except Exception as kafka_err:
+                logger.error(f"❌ Kafka send failed: {kafka_err}", extra={"correlation_id": correlation_id})
+                raise HTTPException(status_code=500, detail=f"Kafka error: {str(kafka_err)}")
+
         else:  # rabbitmq
             if rabbitmq_channel is None:
+                logger.error(f"❌ RabbitMQ not available", extra={"correlation_id": correlation_id})
                 raise HTTPException(status_code=503, detail="RabbitMQ not available")
 
-            await asyncio.wait_for(
-                rabbitmq_channel.default_exchange.publish(
-                    aio_pika.Message(
-                        body=json.dumps(message).encode(),
-                        delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+            logger.info(f"📤 Enqueueing to RabbitMQ...", extra={"correlation_id": correlation_id})
+
+            try:
+                await asyncio.wait_for(
+                    rabbitmq_channel.default_exchange.publish(
+                        aio_pika.Message(
+                            body=json.dumps(message).encode(),
+                            delivery_mode=aio_pika.DeliveryMode.PERSISTENT
+                        ),
+                        routing_key="async_upstream"
                     ),
-                    routing_key="async_upstream"
-                ),
-                timeout=35.0
-            )
-            logger.info(f"📤 Enqueued to RabbitMQ", extra={"correlation_id": correlation_id})
+                    timeout=5.0  # FIX: Reduce timeout
+                )
+                logger.info(f"✅ Enqueued to RabbitMQ", extra={"correlation_id": correlation_id})
+            except asyncio.TimeoutError:
+                logger.error(f"⏰ RabbitMQ send timeout", extra={"correlation_id": correlation_id})
+                raise HTTPException(status_code=504, detail="Timeout enqueueing to RabbitMQ")
+            except Exception as rmq_err:
+                logger.error(f"❌ RabbitMQ send failed: {rmq_err}", extra={"correlation_id": correlation_id})
+                raise HTTPException(status_code=500, detail=f"RabbitMQ error: {str(rmq_err)}")
 
         return JSONResponse(
             status_code=202,
@@ -775,13 +807,13 @@ async def async_upstream(
             }
         )
 
-    except asyncio.TimeoutError:
-        logger.error(f"Timeout enqueueing to {broker}", extra={"correlation_id": correlation_id})
-        raise HTTPException(status_code=504, detail=f"Timeout enqueueing to {broker}")
+    except HTTPException:
+        # Re-raise HTTP exceptions (they're already handled)
+        raise
     except Exception as e:
-        logger.error(f"Failed to enqueue: {e}", extra={"correlation_id": correlation_id})
-        raise HTTPException(status_code=500, detail=f"Failed to enqueue: {str(e)}")
-
+        # Catch any unexpected errors
+        logger.error(f"❌ Unexpected error: {e}", extra={"correlation_id": correlation_id}, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Internal error: {str(e)}")
 @app.post("/external/fetch/async-downstream", tags=["Async Messaging"])
 async def async_downstream(
         correlation_id: str = Header(None, alias="X-Correlation-ID"),
